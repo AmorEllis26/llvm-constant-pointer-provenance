@@ -1,0 +1,233 @@
+From 52a8bf6016a72a706e193e505aade9878bcc280f Mon Sep 17 00:00:00 2001
+From: Amor Ellis <amorssq26@gmail.com>
+Date: Sat, 17 Oct 2026 21:25:18 +0800
+Subject: [PATCH 2/2] [Analysis] Restrict address-equality pointer replacement
+ across provenance
+
+Assisted-by: Claude, Codex
+---
+ llvm/lib/Analysis/Loads.cpp                   | 10 -------
+ llvm/lib/Transforms/Utils/SCCPSolver.cpp      |  9 ++++---
+ llvm/test/Transforms/GVN/assume-equal.ll      | 26 +++++++++++++------
+ .../GVN/constant-pointer-provenance.ll        |  3 ++-
+ llvm/test/Transforms/GVN/invariant.group.ll   | 12 ++++++---
+ llvm/test/Transforms/InstCombine/select.ll    |  5 +++-
+ .../SCCP/constant-pointer-provenance.ll       |  7 +++--
+ ...eferenceable-ptr-with-undereferenceable.ll |  5 ++--
+ llvm/unittests/Analysis/LoadsTest.cpp         |  2 +-
+ 9 files changed, 47 insertions(+), 32 deletions(-)
+
+diff --git a/llvm/lib/Analysis/Loads.cpp b/llvm/lib/Analysis/Loads.cpp
+index 4df216c51..5d84f9bbe 100644
+--- a/llvm/lib/Analysis/Loads.cpp
++++ b/llvm/lib/Analysis/Loads.cpp
+@@ -905,16 +905,6 @@ static bool isPointerAlwaysReplaceable(const Value *From, const Value *To,
+   if (isa<ConstantPointerNull>(From) &&
+       From->getType()->getPointerAddressSpace() == 0)
+     return true;
+-  // Allow replacement with dereferenceable constants. This is not strictly
+-  // correct, but required for vtable assumptions.
+-  auto IsBasedOnConstantGlobal = [](const Value *V) {
+-    auto *GV = dyn_cast<GlobalVariable>(getUnderlyingObject(V));
+-    return GV && GV->isConstant();
+-  };
+-  if (isa<Constant>(To) && To->getType()->isPointerTy() &&
+-      isDereferenceablePointer(To, Type::getInt8Ty(To->getContext()), DL) &&
+-      IsBasedOnConstantGlobal(To))
+-    return true;
+   return getUnderlyingObjectAggressive(From, /*MustPreserveProvenance=*/true) ==
+          getUnderlyingObjectAggressive(To, /*MustPreserveProvenance=*/true);
+ }
+diff --git a/llvm/lib/Transforms/Utils/SCCPSolver.cpp b/llvm/lib/Transforms/Utils/SCCPSolver.cpp
+index 114389ff0..5fd8e7151 100644
+--- a/llvm/lib/Transforms/Utils/SCCPSolver.cpp
++++ b/llvm/lib/Transforms/Utils/SCCPSolver.cpp
+@@ -1874,12 +1874,13 @@ void SCCPInstVisitor::visitGetElementPtrInst(GetElementPtrInst &I) {
+   }
+ 
+   if (Constant *C = ConstantFoldInstOperands(&I, Operands, DL)) {
+-    mergeInValue(ValueState[&I], &I, ValueLatticeElement::get(C));
++    ValueLatticeElement Result = ValueLatticeElement::get(C);
+     // The pointer operand's lattice has found to be a constant, however, the
+     // returned pointer of the GEP may not be freely substituted, as it may have
+     // been derived from a pointer with potentially different provenance.
+     if (PtrMayHaveDifferentProvenance)
+-      ValueState[&I].setMayHaveDifferentProvenance(true);
++      Result.setMayHaveDifferentProvenance(true);
++    mergeInValue(ValueState[&I], &I, Result);
+   } else
+     markOverdefined(&I);
+ }
+@@ -1949,7 +1950,9 @@ void SCCPInstVisitor::visitLoadInst(LoadInst &I) {
+   if (PtrVal.isUnknownOrUndef())
+     return; // The pointer is not resolved yet!
+ 
+-  if (SCCPSolver::isConstant(PtrVal)) {
++  // Address equality alone does not establish the provenance needed to read
++  // the replacement object's initializer or tracked value.
++  if (SCCPSolver::isReplaceableConstant(PtrVal)) {
+     Constant *Ptr = getConstant(PtrVal, I.getOperand(0)->getType());
+     ValueLatticeElement &IV = ValueState[&I];
+ 
+diff --git a/llvm/test/Transforms/GVN/assume-equal.ll b/llvm/test/Transforms/GVN/assume-equal.ll
+index 67b84510b..e0c08b45f 100644
+--- a/llvm/test/Transforms/GVN/assume-equal.ll
++++ b/llvm/test/Transforms/GVN/assume-equal.ll
+@@ -22,10 +22,13 @@ define void @_Z1gb(i1 zeroext %p) {
+ ; CHECK-NEXT:    tail call void @llvm.assume(i1 [[CMP_VTABLES]])
+ ; CHECK-NEXT:    br i1 [[P]], label %[[IF_THEN:.*]], label %[[IF_ELSE:.*]]
+ ; CHECK:       [[IF_THEN]]:
+-; CHECK-NEXT:    [[CALL2:%.*]] = tail call i32 @_ZN1A3fooEv(ptr [[CALL]])
++; CHECK-NEXT:    [[TMP0:%.*]] = load ptr, ptr [[VTABLE]], align 8
++; CHECK-NEXT:    [[CALL2:%.*]] = tail call i32 [[TMP0]](ptr [[CALL]])
+ ; CHECK-NEXT:    br label %[[IF_END:.*]]
+ ; CHECK:       [[IF_ELSE]]:
+-; CHECK-NEXT:    [[CALL5:%.*]] = tail call i32 @_ZN1A3barEv(ptr [[CALL]])
++; CHECK-NEXT:    [[VFN47:%.*]] = getelementptr inbounds ptr, ptr [[VTABLE]], i64 1
++; CHECK-NEXT:    [[TMP1:%.*]] = load ptr, ptr [[VFN47]], align 8
++; CHECK-NEXT:    [[CALL5:%.*]] = tail call i32 [[TMP1]](ptr [[CALL]])
+ ; CHECK-NEXT:    br label %[[IF_END]]
+ ; CHECK:       [[IF_END]]:
+ ; CHECK-NEXT:    ret void
+@@ -69,13 +72,19 @@ define void @invariantGroupHandling(i1 zeroext %p) {
+ ; CHECK-NEXT:    tail call void @llvm.assume(i1 [[CMP_VTABLES]])
+ ; CHECK-NEXT:    br i1 [[P]], label %[[IF_THEN:.*]], label %[[IF_ELSE:.*]]
+ ; CHECK:       [[IF_THEN]]:
+-; CHECK-NEXT:    [[CALL2:%.*]] = tail call i32 @_ZN1A3fooEv(ptr [[CALL]])
+-; CHECK-NEXT:    [[CALLX:%.*]] = tail call i32 @_ZN1A3fooEv(ptr [[CALL]])
+-; CHECK-NEXT:    [[CALLY:%.*]] = tail call i32 @_ZN1A3fooEv(ptr [[CALL]])
+-; CHECK-NEXT:    [[UNKNOWN:%.*]] = tail call i32 @_ZN1A3fooEv(ptr [[CALL]])
++; CHECK-NEXT:    [[TMP0:%.*]] = load ptr, ptr [[VTABLE]], align 8
++; CHECK-NEXT:    [[CALL2:%.*]] = tail call i32 [[TMP0]](ptr [[CALL]])
++; CHECK-NEXT:    [[CALL1:%.*]] = load ptr, ptr [[VTABLE]], align 8
++; CHECK-NEXT:    [[CALLX:%.*]] = tail call i32 [[CALL1]](ptr [[CALL]])
++; CHECK-NEXT:    [[CALL4:%.*]] = load ptr, ptr [[VTABLE]], align 8
++; CHECK-NEXT:    [[CALLY:%.*]] = tail call i32 [[CALL4]](ptr [[CALL]])
++; CHECK-NEXT:    [[VFUN:%.*]] = load ptr, ptr [[VTABLE]], align 8
++; CHECK-NEXT:    [[UNKNOWN:%.*]] = tail call i32 [[VFUN]](ptr [[CALL]])
+ ; CHECK-NEXT:    br label %[[IF_END:.*]]
+ ; CHECK:       [[IF_ELSE]]:
+-; CHECK-NEXT:    [[CALL5:%.*]] = tail call i32 @_ZN1A3barEv(ptr [[CALL]])
++; CHECK-NEXT:    [[VFN47:%.*]] = getelementptr inbounds ptr, ptr [[VTABLE]], i64 1
++; CHECK-NEXT:    [[TMP1:%.*]] = load ptr, ptr [[VFN47]], align 8
++; CHECK-NEXT:    [[CALL5:%.*]] = tail call i32 [[TMP1]](ptr [[CALL]])
+ ; CHECK-NEXT:    br label %[[IF_END]]
+ ; CHECK:       [[IF_END]]:
+ ; CHECK-NEXT:    ret void
+@@ -129,7 +138,8 @@ define i32 @main() {
+ ; CHECK-NEXT:    [[VTABLE:%.*]] = load ptr, ptr [[CALL]], align 8
+ ; CHECK-NEXT:    [[CMP_VTABLES:%.*]] = icmp eq ptr [[VTABLE]], getelementptr inbounds ([4 x ptr], ptr @_ZTV1A, i64 0, i64 2)
+ ; CHECK-NEXT:    tail call void @llvm.assume(i1 [[CMP_VTABLES]])
+-; CHECK-NEXT:    [[CALL2:%.*]] = tail call i32 @_ZN1A3fooEv(ptr [[CALL]])
++; CHECK-NEXT:    [[TMP0:%.*]] = load ptr, ptr [[VTABLE]], align 8
++; CHECK-NEXT:    [[CALL2:%.*]] = tail call i32 [[TMP0]](ptr [[CALL]])
+ ; CHECK-NEXT:    ret i32 0
+ ;
+ entry:
+diff --git a/llvm/test/Transforms/GVN/constant-pointer-provenance.ll b/llvm/test/Transforms/GVN/constant-pointer-provenance.ll
+index c226528bf..5b07119ad 100644
+--- a/llvm/test/Transforms/GVN/constant-pointer-provenance.ll
++++ b/llvm/test/Transforms/GVN/constant-pointer-provenance.ll
+@@ -10,7 +10,8 @@ define i32 @assume_read(ptr align 4 %p) {
+ ; CHECK-SAME: ptr align 4 [[P:%.*]]) {
+ ; CHECK-NEXT:    [[EQ:%.*]] = icmp eq ptr [[P]], @a
+ ; CHECK-NEXT:    call void @llvm.assume(i1 [[EQ]])
+-; CHECK-NEXT:    ret i32 undef
++; CHECK-NEXT:    [[V:%.*]] = load i32, ptr [[P]], align 4
++; CHECK-NEXT:    ret i32 [[V]]
+ ;
+   %eq = icmp eq ptr %p, @a
+   call void @llvm.assume(i1 %eq)
+diff --git a/llvm/test/Transforms/GVN/invariant.group.ll b/llvm/test/Transforms/GVN/invariant.group.ll
+index 50dbfe4f3..1b6e618ba 100644
+--- a/llvm/test/Transforms/GVN/invariant.group.ll
++++ b/llvm/test/Transforms/GVN/invariant.group.ll
+@@ -98,10 +98,14 @@ define void @indirectLoads() {
+ ; CHECK-NEXT:    [[CMP_VTABLES:%.*]] = icmp eq ptr [[VTABLE]], getelementptr inbounds ([3 x ptr], ptr @_ZTV1A, i64 0, i64 2)
+ ; CHECK-NEXT:    call void @llvm.assume(i1 [[CMP_VTABLES]])
+ ; CHECK-NEXT:    store ptr [[CALL]], ptr [[A]], align 8
+-; CHECK-NEXT:    call void @_ZN1A3fooEv(ptr [[CALL]])
+-; CHECK-NEXT:    call void @_ZN1A3fooEv(ptr [[CALL]])
+-; CHECK-NEXT:    call void @_ZN1A3fooEv(ptr [[CALL]])
+-; CHECK-NEXT:    call void @_ZN1A3fooEv(ptr [[CALL]])
++; CHECK-NEXT:    [[TMP0:%.*]] = load ptr, ptr [[VTABLE]], align 8
++; CHECK-NEXT:    call void [[TMP0]](ptr [[CALL]])
++; CHECK-NEXT:    [[TMP1:%.*]] = load ptr, ptr [[VTABLE]], align 8
++; CHECK-NEXT:    call void [[TMP1]](ptr [[CALL]])
++; CHECK-NEXT:    [[TMP2:%.*]] = load ptr, ptr [[VTABLE]], align 8
++; CHECK-NEXT:    call void [[TMP2]](ptr [[CALL]])
++; CHECK-NEXT:    [[TMP3:%.*]] = load ptr, ptr [[VTABLE]], align 8
++; CHECK-NEXT:    call void [[TMP3]](ptr [[CALL]])
+ ; CHECK-NEXT:    ret void
+ ;
+ entry:
+diff --git a/llvm/test/Transforms/InstCombine/select.ll b/llvm/test/Transforms/InstCombine/select.ll
+index 203f15cd6..a2e9b84a8 100644
+--- a/llvm/test/Transforms/InstCombine/select.ll
++++ b/llvm/test/Transforms/InstCombine/select.ll
+@@ -1020,7 +1020,10 @@ define i1 @test60(i32 %x, ptr %y) {
+ define i32 @test61(ptr %ptr) {
+ ; CHECK-LABEL: define i32 @test61(
+ ; CHECK-SAME: ptr [[PTR:%.*]]) {
+-; CHECK-NEXT:    ret i32 10
++; CHECK-NEXT:    [[A:%.*]] = load i32, ptr [[PTR]], align 4
++; CHECK-NEXT:    [[B:%.*]] = icmp eq ptr [[PTR]], @glbl
++; CHECK-NEXT:    [[C:%.*]] = select i1 [[B]], i32 [[A]], i32 10
++; CHECK-NEXT:    ret i32 [[C]]
+ ;
+   %A = load i32, ptr %ptr
+   %B = icmp eq ptr %ptr, @glbl
+diff --git a/llvm/test/Transforms/SCCP/constant-pointer-provenance.ll b/llvm/test/Transforms/SCCP/constant-pointer-provenance.ll
+index cfabcc64e..a22cebc2b 100644
+--- a/llvm/test/Transforms/SCCP/constant-pointer-provenance.ll
++++ b/llvm/test/Transforms/SCCP/constant-pointer-provenance.ll
+@@ -10,7 +10,8 @@ define i32 @branch_read(ptr %p) {
+ ; CHECK-NEXT:    [[EQ:%.*]] = icmp eq ptr [[P]], @a
+ ; CHECK-NEXT:    br i1 [[EQ]], label %[[YES:.*]], label %[[NO:.*]]
+ ; CHECK:       [[YES]]:
+-; CHECK-NEXT:    ret i32 undef
++; CHECK-NEXT:    [[V:%.*]] = load i32, ptr [[P]], align 4
++; CHECK-NEXT:    ret i32 [[V]]
+ ; CHECK:       [[NO]]:
+ ; CHECK-NEXT:    ret i32 0
+ ;
+@@ -29,7 +30,9 @@ define i32 @gep_read(ptr %p) {
+ ; CHECK-NEXT:    [[EQ:%.*]] = icmp eq ptr [[P]], @a
+ ; CHECK-NEXT:    br i1 [[EQ]], label %[[YES:.*]], label %[[NO:.*]]
+ ; CHECK:       [[YES]]:
+-; CHECK-NEXT:    ret i32 0
++; CHECK-NEXT:    [[Q:%.*]] = getelementptr i8, ptr [[P]], i64 4
++; CHECK-NEXT:    [[V:%.*]] = load i32, ptr [[Q]], align 4
++; CHECK-NEXT:    ret i32 [[V]]
+ ; CHECK:       [[NO]]:
+ ; CHECK-NEXT:    ret i32 0
+ ;
+diff --git a/llvm/test/Transforms/SCCP/replace-dereferenceable-ptr-with-undereferenceable.ll b/llvm/test/Transforms/SCCP/replace-dereferenceable-ptr-with-undereferenceable.ll
+index de327a225..3f95a5a23 100644
+--- a/llvm/test/Transforms/SCCP/replace-dereferenceable-ptr-with-undereferenceable.ll
++++ b/llvm/test/Transforms/SCCP/replace-dereferenceable-ptr-with-undereferenceable.ll
+@@ -69,8 +69,9 @@ define i32 @eq_dereferenceable_constant(ptr %p) {
+ ; CHECK-NEXT:    [[CMP:%.*]] = icmp eq ptr [[P:%.*]], @c
+ ; CHECK-NEXT:    br i1 [[CMP]], label [[IF_THEN:%.*]], label [[IF_END:%.*]]
+ ; CHECK:       if.then:
+-; CHECK-NEXT:    call void @use(ptr @c)
+-; CHECK-NEXT:    ret i32 42
++; CHECK-NEXT:    call void @use(ptr [[P]])
++; CHECK-NEXT:    [[V:%.*]] = load i32, ptr [[P]], align 4
++; CHECK-NEXT:    ret i32 [[V]]
+ ; CHECK:       if.end:
+ ; CHECK-NEXT:    ret i32 0
+ ;
+diff --git a/llvm/unittests/Analysis/LoadsTest.cpp b/llvm/unittests/Analysis/LoadsTest.cpp
+index 8b15bda08..1d5e0aa56 100644
+--- a/llvm/unittests/Analysis/LoadsTest.cpp
++++ b/llvm/unittests/Analysis/LoadsTest.cpp
+@@ -132,7 +132,7 @@ define void @f(ptr %p1, ptr %p2, i64 %i, ptr addrspace(1) %p1as1) {
+   // same underlying object.
+   EXPECT_FALSE(canReplacePointersIfEqual(ConstDerefPtr, P1, DL));
+   EXPECT_FALSE(canReplacePointersIfEqual(P1, P2, DL));
+-  EXPECT_TRUE(canReplacePointersIfEqual(P1, ConstDerefPtr, DL));
++  EXPECT_FALSE(canReplacePointersIfEqual(P1, ConstDerefPtr, DL));
+   EXPECT_TRUE(canReplacePointersIfEqual(P1, NullPtr, DL));
+ 
+   // Allow replacement of null in default address space with pointer, as in
